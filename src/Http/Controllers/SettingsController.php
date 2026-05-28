@@ -2,8 +2,8 @@
 
 namespace ApeDev\M365Mailer\Http\Controllers;
 
+use ApeDev\M365Mailer\Support\Settings;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
 use Statamic\Facades\User;
@@ -26,7 +26,8 @@ class SettingsController
             'proxyConfigured' => filled($proxy),
             'registeredRedirectUri' => $proxy ?: cp_route('m365-mailer.callback'),
             'siteCallbackUri' => cp_route('m365-mailer.callback'),
-            'connection' => $this->connectionState(),
+            'connection' => Settings::connection(),
+            'fromMailbox' => Settings::fromMailbox(),
         ]);
     }
 
@@ -91,21 +92,38 @@ class SettingsController
                 ->with('error', __('Admin consent was not granted.'));
         }
 
-        $this->saveConnectionState([
+        Settings::put(['connection' => [
             'tenant' => $request->query('tenant'),
             'consented_at' => now()->toIso8601String(),
             'consented_by' => User::current()?->email(),
-        ]);
+        ]]);
 
         return redirect()->route('statamic.cp.m365-mailer.index')
             ->with('success', __('Microsoft 365 connected — admin consent granted.'));
+    }
+
+    public function saveMailbox(Request $request)
+    {
+        $this->authorizeSuper();
+
+        $mailbox = trim((string) $request->input('from_mailbox'));
+
+        if ($mailbox !== '' && ! filter_var($mailbox, FILTER_VALIDATE_EMAIL)) {
+            return back()->with('error', __('Enter a valid email address, or leave empty for "all / decide per form".'));
+        }
+
+        Settings::put(['from_mailbox' => $mailbox ?: null]);
+
+        return back()->with('success', $mailbox === ''
+            ? __('Sender set to "all / decide per form".')
+            : __('Sender mailbox saved: :address.', ['address' => $mailbox]));
     }
 
     public function test()
     {
         $this->authorizeSuper();
 
-        $recipient = config('mail.from.address');
+        $recipient = Settings::fromMailbox() ?: config('mail.from.address');
 
         try {
             Mail::mailer('microsoft-graph')->raw(
@@ -176,23 +194,5 @@ class SettingsController
     private function b64UrlDecode(string $value): string
     {
         return (string) base64_decode(strtr($value, '-_', '+/'), true);
-    }
-
-    private function statePath(): string
-    {
-        return storage_path('m365-mailer/connection.json');
-    }
-
-    private function connectionState(): ?array
-    {
-        return File::exists($path = $this->statePath())
-            ? json_decode(File::get($path), true)
-            : null;
-    }
-
-    private function saveConnectionState(array $data): void
-    {
-        File::ensureDirectoryExists(dirname($this->statePath()));
-        File::put($this->statePath(), json_encode($data, JSON_PRETTY_PRINT));
     }
 }

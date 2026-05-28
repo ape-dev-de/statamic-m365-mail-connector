@@ -2,6 +2,7 @@
 
 namespace ApeDev\M365Mailer;
 
+use ApeDev\M365Mailer\Support\Settings;
 use ApeDev\M365Mailer\Transport\MicrosoftGraphTransport;
 use Illuminate\Support\Facades\Mail;
 use InvalidArgumentException;
@@ -61,6 +62,7 @@ class M365MailerServiceProvider extends AddonServiceProvider
                 certificatePath: $config['certificate_path'] ?? null,
                 certificate: $config['certificate'] ?? null,
                 saveToSentItems: (bool) ($config['save_to_sent_items'] ?? false),
+                fromResolver: fn () => Settings::fromMailbox(),
             );
         });
     }

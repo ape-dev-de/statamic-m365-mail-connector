@@ -23,12 +23,16 @@ class MicrosoftGraphTransport extends AbstractTransport
 {
     private const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
+    /**
+     * @param  (\Closure(): ?string)|null  $fromResolver  Returns the mailbox to pin "From" to, or null to leave it.
+     */
     public function __construct(
         private readonly string $tenantId,
         private readonly string $clientId,
         private readonly ?string $certificatePath = null,
         private readonly ?string $certificate = null,
         private readonly bool $saveToSentItems = false,
+        private readonly ?\Closure $fromResolver = null,
     ) {
         parent::__construct();
     }
@@ -36,6 +40,8 @@ class MicrosoftGraphTransport extends AbstractTransport
     protected function doSend(SentMessage $message): void
     {
         $email = MessageConverter::toEmail($message->getOriginalMessage());
+
+        $this->pinFrom($email);
 
         $from = $email->getFrom();
         if ($from === []) {
@@ -61,6 +67,28 @@ class MicrosoftGraphTransport extends AbstractTransport
     public function __toString(): string
     {
         return 'microsoft-graph';
+    }
+
+    /**
+     * If a sender mailbox is configured in the CP, force it as "From" (Graph sends
+     * via /users/{from}/sendMail). Any prior sender is demoted to Reply-To so the
+     * original address (e.g. a contact-form visitor) stays reachable.
+     */
+    private function pinFrom(Email $email): void
+    {
+        $mailbox = $this->fromResolver ? ($this->fromResolver)() : null;
+
+        if (! $mailbox) {
+            return;
+        }
+
+        $current = $email->getFrom();
+
+        if ($current !== [] && strcasecmp($current[0]->getAddress(), $mailbox) !== 0 && $email->getReplyTo() === []) {
+            $email->replyTo($current[0]);
+        }
+
+        $email->from(new Address($mailbox));
     }
 
     private function toGraphMessage(Email $email): array

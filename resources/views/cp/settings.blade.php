@@ -70,6 +70,25 @@
             @endif
         </div>
 
+        <div style="background:#fff; border:1px solid #e3e8ef; border-radius:.75rem; padding:1.25rem 1.5rem; margin-bottom:1.25rem;">
+            <h2 style="font-size:1rem; margin:0 0 .25rem;">{{ __('Sender mailbox') }}</h2>
+            <p style="color:#6b7280; font-size:.875rem; margin:0 0 .75rem;">
+                {{ __('Mailbox the connector sends from (Graph sends via /users/{mailbox}/sendMail). Leave empty for "all / decide per form" — then the From comes from each form or the global mail config.') }}
+            </p>
+            <form method="POST" action="{{ cp_route('m365-mailer.mailbox') }}" style="display:flex; gap:.5rem; align-items:center; margin:0;">
+                @csrf
+                <input type="email" name="from_mailbox" value="{{ $fromMailbox }}" placeholder="kontakt@festglanz.de"
+                       style="flex:1; padding:.5rem .75rem; border:1px solid #d1d5db; border-radius:.5rem; font-family:monospace;">
+                <button type="submit"
+                        style="padding:.55rem 1.1rem; border-radius:.5rem; background:#111827; color:#fff; border:none; font-weight:600; cursor:pointer;">
+                    {{ __('Save') }}
+                </button>
+            </form>
+            <p style="color:#9ca3af; font-size:.8125rem; margin:.6rem 0 0;">
+                {{ __('Note: this only chooses the sender. It does not restrict what the app can send as — tenant-wide Mail.Send remains until an Exchange admin scopes it.') }}
+            </p>
+        </div>
+
         <div style="display:flex; gap:.75rem; align-items:center;">
             <a href="{{ cp_route('m365-mailer.consent') }}"
                style="display:inline-block; padding:.55rem 1.1rem; border-radius:.5rem; background:#2563eb; color:#fff; text-decoration:none; font-weight:600; {{ $configured ? '' : 'opacity:.5; pointer-events:none;' }}">
