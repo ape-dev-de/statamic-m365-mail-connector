@@ -1,0 +1,38 @@
+{
+    "name": "ape-dev/laravel-m365-mailer",
+    "description": "Laravel mail transport for Microsoft 365 via Microsoft Graph using certificate-based app-only (client credentials) auth.",
+    "type": "library",
+    "license": "proprietary",
+    "keywords": ["laravel", "mail", "microsoft365", "microsoft-graph", "office365", "statamic"],
+    "require": {
+        "php": "^8.2",
+        "ext-openssl": "*",
+        "illuminate/mail": "^11.0|^12.0",
+        "illuminate/support": "^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "ApeDev\\M365Mailer\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "ApeDev\\M365Mailer\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "ApeDev\\M365Mailer\\M365MailerServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "config": {
+        "sort-packages": true
+    }
+}

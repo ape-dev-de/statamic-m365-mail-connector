@@ -1,0 +1,16 @@
+/vendor/
+composer.lock
+.phpunit.result.cache
+.idea/
+.DS_Store
+
+# Never commit private keys / certificate material
+*.key
+*.pem
+*.pfx
+*.p12
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/*.tfvars
+!deploy/terraform/*.tfvars.example

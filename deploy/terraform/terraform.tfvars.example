@@ -1,0 +1,14 @@
+home_tenant_id = "00000000-0000-0000-0000-000000000000" # Ape Dev tenant
+
+# Generate each cert with ../generate-certificate.sh, then paste the .crt contents here.
+# During rotation, keep both the current and the next cert in this map.
+certificates = {
+  "2026" = {
+    value = <<-EOT
+      -----BEGIN CERTIFICATE-----
+      ...paste contents of ape-dev-m365-2026.crt...
+      -----END CERTIFICATE-----
+    EOT
+  }
+  # "2027" = { value = "-----BEGIN CERTIFICATE-----\n...next cert...\n-----END CERTIFICATE-----" }
+}
