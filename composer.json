@@ -1,14 +1,15 @@
 {
     "name": "ape-dev/laravel-m365-mailer",
-    "description": "Laravel mail transport for Microsoft 365 via Microsoft Graph using certificate-based app-only (client credentials) auth.",
-    "type": "library",
+    "description": "Statamic addon: Microsoft 365 mail transport via Microsoft Graph (certificate app-only auth) with a CP admin-consent settings page.",
+    "type": "statamic-addon",
     "license": "proprietary",
-    "keywords": ["laravel", "mail", "microsoft365", "microsoft-graph", "office365", "statamic"],
+    "keywords": ["laravel", "statamic", "statamic-addon", "mail", "microsoft365", "microsoft-graph", "office365"],
     "require": {
         "php": "^8.2",
         "ext-openssl": "*",
         "illuminate/mail": "^11.0|^12.0",
-        "illuminate/support": "^11.0|^12.0"
+        "illuminate/support": "^11.0|^12.0",
+        "statamic/cms": "^6.0"
     },
     "require-dev": {
         "orchestra/testbench": "^9.0|^10.0"
@@ -24,6 +25,10 @@
         }
     },
     "extra": {
+        "statamic": {
+            "name": "Microsoft 365 Mailer",
+            "description": "Microsoft 365 mail via Microsoft Graph with a CP admin-consent page."
+        },
         "laravel": {
             "providers": [
                 "ApeDev\\M365Mailer\\M365MailerServiceProvider"

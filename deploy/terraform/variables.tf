@@ -20,3 +20,13 @@ variable "certificates" {
     end_date = optional(string) # RFC3339, e.g. "2036-05-28T00:00:00Z"; defaults to the cert's own notAfter
   }))
 }
+
+# Single shared consent-proxy callback, registered ONCE for all customers,
+# e.g. ["https://m365-mailer-callback.ape-dev.de/callback"]. The real per-site CP
+# callback travels inside the HMAC-signed state and is never registered here, so
+# onboarding a customer requires no change to this app registration.
+variable "redirect_uris" {
+  description = "Consent-proxy callback URL(s). Registered once; not per customer."
+  type        = list(string)
+  default     = []
+}

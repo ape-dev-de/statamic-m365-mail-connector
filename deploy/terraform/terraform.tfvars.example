@@ -1,5 +1,10 @@
 home_tenant_id = "00000000-0000-0000-0000-000000000000" # Ape Dev tenant
 
+# Single shared consent proxy — registered once for all customers.
+redirect_uris = [
+  "https://m365-mailer-callback.ape-dev.de/callback",
+]
+
 # Generate each cert with ../generate-certificate.sh, then paste the .crt contents here.
 # During rotation, keep both the current and the next cert in this map.
 certificates = {

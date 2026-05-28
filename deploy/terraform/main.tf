@@ -7,6 +7,10 @@ resource "azuread_application" "connector" {
   display_name     = var.display_name
   sign_in_audience = "AzureADMultipleOrgs" # multi-tenant: customers admin-consent into this single app
 
+  web {
+    redirect_uris = var.redirect_uris # CP admin-consent callbacks, one per customer site
+  }
+
   required_resource_access {
     resource_app_id = local.microsoft_graph_app_id
 
