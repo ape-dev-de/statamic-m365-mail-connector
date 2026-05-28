@@ -50,6 +50,13 @@ class SettingsController
                 ->with('error', __('M365_PROXY_REDIRECT_URI is set but M365_PROXY_SECRET is missing.'));
         }
 
+        $tenant = ($config['tenant_id'] ?? null) ?: $this->tenantFromSender();
+
+        if (! $tenant) {
+            return redirect()->route('statamic.cp.m365-mailer.index')
+                ->with('error', __('Set a sender mailbox (or MAIL_FROM_ADDRESS) so the tenant can be resolved.'));
+        }
+
         $nonce = Str::random(40);
         $request->session()->put('m365_consent_nonce', $nonce);
 
@@ -58,7 +65,7 @@ class SettingsController
         $redirectUri = $proxy ?: cp_route('m365-mailer.callback');
         $state = $this->buildState(cp_route('m365-mailer.callback'), $nonce, $secret ?: config('app.key'));
 
-        $url = "https://login.microsoftonline.com/{$config['tenant_id']}/adminconsent?".http_build_query([
+        $url = "https://login.microsoftonline.com/{$tenant}/adminconsent?".http_build_query([
             'client_id' => $config['client_id'],
             'redirect_uri' => $redirectUri,
             'state' => $state,
@@ -144,9 +151,16 @@ class SettingsController
 
     private function isConfigured(array $config): bool
     {
-        return filled($config['tenant_id'] ?? null)
-            && filled($config['client_id'] ?? null)
+        // tenant_id is optional — autodiscovered from consent or the sender domain.
+        return filled($config['client_id'] ?? null)
             && (filled($config['certificate_path'] ?? null) || filled($config['certificate'] ?? null));
+    }
+
+    private function tenantFromSender(): ?string
+    {
+        $sender = Settings::fromMailbox() ?: config('mail.from.address');
+
+        return $sender && str_contains($sender, '@') ? Str::after($sender, '@') : null;
     }
 
     private function authorizeSuper(): void

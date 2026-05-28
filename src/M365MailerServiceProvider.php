@@ -44,11 +44,11 @@ class M365MailerServiceProvider extends AddonServiceProvider
     private function registerMailTransport(): void
     {
         Mail::extend('microsoft-graph', function (array $config) {
-            foreach (['tenant_id', 'client_id'] as $required) {
-                if (empty($config[$required])) {
-                    throw new InvalidArgumentException("M365 mailer: missing required config [{$required}].");
-                }
+            if (empty($config['client_id'])) {
+                throw new InvalidArgumentException('M365 mailer: missing required config [client_id].');
             }
+
+            // tenant_id is optional — resolved from consent or the sender domain at send time.
 
             if (empty($config['certificate_path']) && empty($config['certificate'])) {
                 throw new InvalidArgumentException(
@@ -57,7 +57,7 @@ class M365MailerServiceProvider extends AddonServiceProvider
             }
 
             return new MicrosoftGraphTransport(
-                tenantId: $config['tenant_id'],
+                tenantId: $config['tenant_id'] ?? null,
                 clientId: $config['client_id'],
                 certificatePath: $config['certificate_path'] ?? null,
                 certificate: $config['certificate'] ?? null,

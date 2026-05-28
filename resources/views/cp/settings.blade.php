@@ -31,8 +31,16 @@
             </div>
 
             <dl style="display: grid; grid-template-columns: 180px 1fr; gap: .4rem 1rem; font-size: .875rem; margin: 0;">
-                <dt style="color:#6b7280;">{{ __('Tenant ID') }}</dt>
-                <dd style="margin:0; font-family: monospace;">{{ $tenantId ?: '—' }}</dd>
+                <dt style="color:#6b7280;">{{ __('Tenant') }}</dt>
+                <dd style="margin:0; font-family: monospace;">
+                    @if ($tenantId)
+                        {{ $tenantId }}
+                    @elseif ($connection['tenant'] ?? null)
+                        {{ $connection['tenant'] }} <span style="color:#9ca3af;">({{ __('from consent') }})</span>
+                    @else
+                        <span style="color:#9ca3af;">{{ __('auto (from sender domain)') }}</span>
+                    @endif
+                </dd>
 
                 <dt style="color:#6b7280;">{{ __('Client ID') }}</dt>
                 <dd style="margin:0; font-family: monospace;">{{ $clientId ?: '—' }}</dd>

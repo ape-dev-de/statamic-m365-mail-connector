@@ -2,6 +2,7 @@
 
 namespace ApeDev\M365Mailer\Transport;
 
+use ApeDev\M365Mailer\Support\Settings;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Str;
@@ -27,7 +28,7 @@ class MicrosoftGraphTransport extends AbstractTransport
      * @param  (\Closure(): ?string)|null  $fromResolver  Returns the mailbox to pin "From" to, or null to leave it.
      */
     public function __construct(
-        private readonly string $tenantId,
+        private readonly ?string $tenantId,
         private readonly string $clientId,
         private readonly ?string $certificatePath = null,
         private readonly ?string $certificate = null,
@@ -48,8 +49,9 @@ class MicrosoftGraphTransport extends AbstractTransport
             throw new TransportException('M365 mailer: message has no "From" address; it must equal the licensed mailbox.');
         }
         $sender = $from[0]->getAddress();
+        $tenant = $this->resolveTenant($sender);
 
-        $response = Http::withToken($this->accessToken())
+        $response = Http::withToken($this->accessToken($tenant))
             ->acceptJson()
             ->asJson()
             ->post(self::GRAPH_BASE.'/users/'.rawurlencode($sender).'/sendMail', [
@@ -144,15 +146,33 @@ class MicrosoftGraphTransport extends AbstractTransport
         return $attachments;
     }
 
-    private function accessToken(): string
+    /**
+     * Resolve the tenant: explicit env override → tenant GUID captured at admin
+     * consent → domain of the sender mailbox (Microsoft accepts a verified domain
+     * in place of the GUID). So M365_TENANT_ID is optional.
+     */
+    private function resolveTenant(string $sender): string
     {
-        $cacheKey = "m365-mailer:token:{$this->tenantId}:{$this->clientId}";
+        $tenant = $this->tenantId
+            ?: (Settings::connection()['tenant'] ?? null)
+            ?: (str_contains($sender, '@') ? Str::after($sender, '@') : null);
+
+        if (! $tenant) {
+            throw new TransportException('M365 mailer: cannot resolve tenant — set a sender mailbox or M365_TENANT_ID.');
+        }
+
+        return $tenant;
+    }
+
+    private function accessToken(string $tenant): string
+    {
+        $cacheKey = "m365-mailer:token:{$tenant}:{$this->clientId}";
 
         if ($token = Cache::get($cacheKey)) {
             return $token;
         }
 
-        $tokenUrl = "https://login.microsoftonline.com/{$this->tenantId}/oauth2/v2.0/token";
+        $tokenUrl = "https://login.microsoftonline.com/{$tenant}/oauth2/v2.0/token";
 
         $response = Http::asForm()->post($tokenUrl, [
             'client_id' => $this->clientId,
