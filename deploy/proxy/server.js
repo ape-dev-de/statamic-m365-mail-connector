@@ -27,10 +27,11 @@ const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 // Capability tokens — cap = base64url(JSON {tenant,iat,exp}).base64url(HMAC)
 // ---------------------------------------------------------------------------
 
-// ttlSec falsy (0/null) => non-expiring token (advisable only with per-tenant revocation).
-function makeCapabilityToken(tenant, secret, ttlSec) {
+// ttlSec falsy (0/null) => non-expiring token. `ver` ties the token to the tenant's
+// current revocation version so bumping it kills all of that tenant's older tokens.
+function makeCapabilityToken(tenant, secret, ttlSec, ver = 0) {
   const now = Math.floor(Date.now() / 1000);
-  const payload = { tenant, iat: now };
+  const payload = { tenant, iat: now, ver };
   if (ttlSec) payload.exp = now + ttlSec;
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
@@ -67,7 +68,60 @@ function verifyCapabilityToken(cap, secret) {
     if (typeof payload.exp !== 'number' || Math.floor(Date.now() / 1000) >= payload.exp) return null;
   }
 
-  return { tenant: payload.tenant };
+  return { tenant: payload.tenant, ver: Number(payload.ver) || 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Revocation — per-tenant version, file-backed so it survives restarts and can
+// be bumped at runtime (POST /admin/revoke). Bumping invalidates that tenant's
+// older capability tokens immediately, without touching any other tenant.
+// ---------------------------------------------------------------------------
+
+function makeRevocationStore(path) {
+  let cache = {};
+  let mtime = -1;
+
+  function load() {
+    if (!path) return;
+    try {
+      const st = fs.statSync(path);
+      if (st.mtimeMs !== mtime) {
+        cache = JSON.parse(fs.readFileSync(path, 'utf8')) || {};
+        mtime = st.mtimeMs;
+      }
+    } catch {
+      cache = {};
+      mtime = -1;
+    }
+  }
+
+  return {
+    version(tenant) {
+      load();
+      return Number(cache[tenant]) || 0;
+    },
+    revoke(tenant) {
+      load();
+      cache[tenant] = (Number(cache[tenant]) || 0) + 1;
+      if (path) fs.writeFileSync(path, JSON.stringify(cache, null, 2));
+      return cache[tenant];
+    },
+  };
+}
+
+// Per-tenant sliding-window rate limit (in-memory). Transient misuse guard: a
+// burst (e.g. a leaked token blasting mail) gets 429'd without a permanent lockout.
+function makeRateLimiter(max, windowSec) {
+  const hits = new Map();
+  return function allow(tenant) {
+    if (!max) return true;
+    const now = Date.now();
+    const cutoff = now - windowSec * 1000;
+    const arr = (hits.get(tenant) || []).filter((t) => t > cutoff);
+    arr.push(now);
+    hits.set(tenant, arr);
+    return arr.length <= max;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +296,8 @@ function handleCallback(req, res, url, config) {
       return res.end('missing tenant');
     }
     const ttlSec = resolveTtlSec(Number(parsed.ttl_days), config);
-    const cap = makeCapabilityToken(tenant, config.signingSecret, ttlSec);
+    const ver = config.revocations ? config.revocations.version(tenant) : 0;
+    const cap = makeCapabilityToken(tenant, config.signingSecret, ttlSec, ver);
     target.searchParams.set('admin_consent', 'True');
     target.searchParams.set('tenant', tenant);
     passthrough('state');
@@ -265,6 +320,16 @@ async function handleSend(req, res, config) {
   if (!claims) {
     res.writeHead(401);
     return res.end('invalid capability');
+  }
+
+  if (config.revocations && claims.ver < config.revocations.version(claims.tenant)) {
+    res.writeHead(401);
+    return res.end('capability revoked');
+  }
+
+  if (config.rateLimiter && !config.rateLimiter(claims.tenant)) {
+    res.writeHead(429);
+    return res.end('rate limit exceeded');
   }
 
   let body;
@@ -314,6 +379,40 @@ async function handleSend(req, res, config) {
   return res.end(text);
 }
 
+// POST /admin/revoke {tenant} with header X-Admin-Secret — bumps the tenant's
+// revocation version, instantly killing its existing capability tokens.
+async function handleRevoke(req, res, config) {
+  if (!config.adminSecret || !config.revocations) {
+    res.writeHead(404);
+    return res.end('not found');
+  }
+
+  const provided = Buffer.from(req.headers['x-admin-secret'] || '');
+  const expected = Buffer.from(config.adminSecret);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) {
+    res.writeHead(401);
+    return res.end('unauthorized');
+  }
+
+  let body;
+  try {
+    body = await readJson(req);
+  } catch {
+    res.writeHead(400);
+    return res.end('invalid JSON body');
+  }
+
+  const tenant = body && body.tenant;
+  if (typeof tenant !== 'string' || tenant === '') {
+    res.writeHead(400);
+    return res.end('tenant required');
+  }
+
+  const version = config.revocations.revoke(tenant);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  return res.end(JSON.stringify({ tenant, version }));
+}
+
 function createServer(config) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -331,6 +430,12 @@ function createServer(config) {
         res.end('internal error');
       });
     }
+    if (req.method === 'POST' && url.pathname === '/admin/revoke') {
+      return handleRevoke(req, res, config).catch(() => {
+        if (!res.headersSent) res.writeHead(500);
+        res.end('internal error');
+      });
+    }
 
     res.writeHead(404);
     res.end('not found');
@@ -341,6 +446,8 @@ module.exports = {
   makeCapabilityToken,
   resolveTtlSec,
   verifyCapabilityToken,
+  makeRevocationStore,
+  makeRateLimiter,
   parseState,
   originAllowed,
   loadCert,
@@ -389,6 +496,11 @@ if (require.main === module) {
     maxTtlDays,
     getToken,
     fetchImpl: fetch,
+    // Revocation store (file-backed); kill switch via POST /admin/revoke.
+    revocations: makeRevocationStore(process.env.REVOCATIONS_PATH || ''),
+    adminSecret: process.env.RELAY_ADMIN_SECRET || '',
+    // Transient misuse guard: max sends per tenant per window.
+    rateLimiter: makeRateLimiter(Number(process.env.SEND_RATE_MAX) || 60, Number(process.env.SEND_RATE_WINDOW_SEC) || 60),
   };
 
   createServer(config).listen(PORT, () => console.log(`m365 mail relay listening on :${PORT}`));
