@@ -54,7 +54,7 @@
                     @elseif ($connection['tenant'] ?? null)
                         {{ $connection['tenant'] }} <span style="{{ $muted }}">({{ __('from consent') }})</span>
                     @else
-                        <span style="{{ $muted }}">{{ __('auto (from sender domain)') }}</span>
+                        <span style="{{ $muted }}">{{ __('resolved at consent (common)') }}</span>
                     @endif
                 </dd>
 

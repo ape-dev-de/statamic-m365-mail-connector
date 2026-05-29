@@ -47,12 +47,10 @@ class SettingsController
                 ->with('error', __('Set M365_CLIENT_ID and M365_RELAY_URL before connecting.'));
         }
 
-        $tenant = ($config['tenant_id'] ?? null) ?: $this->tenantFromSender();
-
-        if (! $tenant) {
-            return redirect()->route('statamic.cp.m365-mailer.index')
-                ->with('error', __('Set a sender mailbox (or MAIL_FROM_ADDRESS) so the tenant can be resolved.'));
-        }
+        // Multi-tenant admin consent: "common" lets the admin consent for THEIR
+        // tenant; Microsoft returns the real tenant GUID in the callback (the relay
+        // then uses that GUID to send). An explicit M365_TENANT_ID overrides.
+        $tenant = ($config['tenant_id'] ?? null) ?: 'common';
 
         $nonce = Str::random(40);
         $request->session()->put('m365_consent_nonce', $nonce);
@@ -177,13 +175,6 @@ class SettingsController
         return filled($config['relay_url'] ?? null)
             ? rtrim($config['relay_url'], '/').'/callback'
             : null;
-    }
-
-    private function tenantFromSender(): ?string
-    {
-        $sender = Settings::fromMailbox() ?: config('mail.from.address');
-
-        return $sender && str_contains($sender, '@') ? Str::after($sender, '@') : null;
     }
 
     private function authorizeSuper(): void
