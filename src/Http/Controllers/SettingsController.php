@@ -15,18 +15,17 @@ class SettingsController
         $this->authorizeSuper();
 
         $config = $this->mailerConfig();
-        $proxy = $config['proxy_redirect_uri'] ?? null;
 
         return view('m365-mailer::cp.settings', [
             'configured' => $this->isConfigured($config),
             'isDefaultMailer' => config('mail.default') === 'microsoft-graph',
-            'tenantId' => $config['tenant_id'] ?? null,
             'clientId' => $config['client_id'] ?? null,
+            'tenantId' => $config['tenant_id'] ?? null,
             'fromAddress' => config('mail.from.address'),
-            'proxyConfigured' => filled($proxy),
-            'registeredRedirectUri' => $proxy ?: cp_route('m365-mailer.callback'),
-            'siteCallbackUri' => cp_route('m365-mailer.callback'),
+            'relayUrl' => $config['relay_url'] ?? null,
+            'relayCallback' => $this->relayCallbackUrl($config),
             'connection' => Settings::connection(),
+            'connected' => Settings::relayToken() !== null,
             'fromMailbox' => Settings::fromMailbox(),
         ]);
     }
@@ -39,15 +38,7 @@ class SettingsController
 
         if (! $this->isConfigured($config)) {
             return redirect()->route('statamic.cp.m365-mailer.index')
-                ->with('error', __('Set M365_TENANT_ID, M365_CLIENT_ID and the certificate before connecting.'));
-        }
-
-        $proxy = $config['proxy_redirect_uri'] ?? null;
-        $secret = $config['proxy_secret'] ?? null;
-
-        if ($proxy && ! $secret) {
-            return redirect()->route('statamic.cp.m365-mailer.index')
-                ->with('error', __('M365_PROXY_REDIRECT_URI is set but M365_PROXY_SECRET is missing.'));
+                ->with('error', __('Set M365_CLIENT_ID and M365_RELAY_URL before connecting.'));
         }
 
         $tenant = ($config['tenant_id'] ?? null) ?: $this->tenantFromSender();
@@ -60,15 +51,13 @@ class SettingsController
         $nonce = Str::random(40);
         $request->session()->put('m365_consent_nonce', $nonce);
 
-        // redirect_uri = the single proxy URL registered on the app. The real CP
-        // callback travels inside the (HMAC-signed) state; the proxy forwards there.
-        $redirectUri = $proxy ?: cp_route('m365-mailer.callback');
-        $state = $this->buildState(cp_route('m365-mailer.callback'), $nonce, $secret ?: config('app.key'));
-
+        // redirect_uri = the relay (registered once on the app). The relay verifies
+        // the return origin against its allowlist, mints a per-tenant capability
+        // token, and forwards it back to this CP callback inside the redirect.
         $url = "https://login.microsoftonline.com/{$tenant}/adminconsent?".http_build_query([
             'client_id' => $config['client_id'],
-            'redirect_uri' => $redirectUri,
-            'state' => $state,
+            'redirect_uri' => $this->relayCallbackUrl($config),
+            'state' => $this->encodeState(cp_route('m365-mailer.callback'), $nonce),
         ]);
 
         return redirect()->away($url);
@@ -78,11 +67,8 @@ class SettingsController
     {
         $this->authorizeSuper();
 
-        $config = $this->mailerConfig();
-        $secret = ($config['proxy_secret'] ?? null) ?: config('app.key');
-
         $nonce = $request->session()->pull('m365_consent_nonce');
-        $payload = $this->verifyState((string) $request->query('state'), $secret);
+        $payload = $this->decodeState((string) $request->query('state'));
 
         if (! $nonce || ! $payload || ! hash_equals($nonce, $payload['nonce'] ?? '')) {
             return redirect()->route('statamic.cp.m365-mailer.index')
@@ -99,11 +85,20 @@ class SettingsController
                 ->with('error', __('Admin consent was not granted.'));
         }
 
-        Settings::put(['connection' => [
-            'tenant' => $request->query('tenant'),
-            'consented_at' => now()->toIso8601String(),
-            'consented_by' => User::current()?->email(),
-        ]]);
+        $token = (string) $request->query('cap');
+        if ($token === '') {
+            return redirect()->route('statamic.cp.m365-mailer.index')
+                ->with('error', __('The relay did not return a capability token.'));
+        }
+
+        Settings::put([
+            'connection' => [
+                'tenant' => $request->query('tenant'),
+                'consented_at' => now()->toIso8601String(),
+                'consented_by' => User::current()?->email(),
+            ],
+            'relay_token' => $token,
+        ]);
 
         return redirect()->route('statamic.cp.m365-mailer.index')
             ->with('success', __('Microsoft 365 connected — admin consent granted.'));
@@ -151,9 +146,16 @@ class SettingsController
 
     private function isConfigured(array $config): bool
     {
-        // tenant_id is optional — autodiscovered from consent or the sender domain.
-        return filled($config['client_id'] ?? null)
-            && (filled($config['certificate_path'] ?? null) || filled($config['certificate'] ?? null));
+        // The certificate lives only at the relay; this box just needs to know
+        // the shared client_id (for the consent URL) and the relay URL.
+        return filled($config['client_id'] ?? null) && filled($config['relay_url'] ?? null);
+    }
+
+    private function relayCallbackUrl(array $config): ?string
+    {
+        return filled($config['relay_url'] ?? null)
+            ? rtrim($config['relay_url'], '/').'/callback'
+            : null;
     }
 
     private function tenantFromSender(): ?string
@@ -168,30 +170,21 @@ class SettingsController
         abort_unless(User::current()?->isSuper(), 403);
     }
 
-    private function buildState(string $origin, string $nonce, string $secret): string
+    // state carries the return origin + a CSRF nonce. No signature here: the relay
+    // guards open-redirect via its origin allowlist, and the nonce is validated
+    // against this box's session on return.
+    private function encodeState(string $origin, string $nonce): string
     {
-        $body = $this->b64UrlEncode(json_encode([
+        return $this->b64UrlEncode(json_encode([
             'origin' => $origin,
             'nonce' => $nonce,
             'ts' => time(),
         ]));
-
-        return $body.'.'.$this->b64UrlEncode(hash_hmac('sha256', $body, $secret, true));
     }
 
-    private function verifyState(string $state, string $secret): ?array
+    private function decodeState(string $state): ?array
     {
-        if (! str_contains($state, '.')) {
-            return null;
-        }
-
-        [$body, $signature] = explode('.', $state, 2);
-
-        if (! hash_equals($this->b64UrlEncode(hash_hmac('sha256', $body, $secret, true)), $signature)) {
-            return null;
-        }
-
-        $payload = json_decode($this->b64UrlDecode($body), true);
+        $payload = json_decode($this->b64UrlDecode($state), true);
 
         if (! is_array($payload) || (time() - ($payload['ts'] ?? 0)) > 3600) {
             return null;

@@ -30,6 +30,5 @@ echo "------------------------------------------------------------------"
 cat "${NAME}.crt"
 echo "------------------------------------------------------------------"
 echo
-echo "Runtime credential: mount ${NAME}.pem and set M365_CERTIFICATE_PATH to its path,"
-echo "or inline it (single-line base64) as M365_CERTIFICATE:"
-base64 < "${NAME}.pem" | tr -d '\n'; echo
+echo "Private key (${NAME}.pem / ${NAME}.key): deploy ONLY to the RELAY's secret store."
+echo "Never put it on customer sites — they authenticate to the relay with a per-tenant token."

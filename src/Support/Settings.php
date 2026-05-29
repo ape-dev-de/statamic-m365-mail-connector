@@ -48,4 +48,15 @@ class Settings
 
         return is_string($value) && $value !== '' ? $value : null;
     }
+
+    /**
+     * Per-tenant capability token issued by the relay at admin consent. Presented
+     * on every /send; scoped to this tenant, so a leak here is limited to it.
+     */
+    public static function relayToken(): ?string
+    {
+        $value = self::get('relay_token');
+
+        return is_string($value) && $value !== '' ? $value : null;
+    }
 }
