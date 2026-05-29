@@ -16,6 +16,9 @@ class SettingsController
 
         $config = $this->mailerConfig();
 
+        $envToken = $config['relay_token'] ?? null;
+        $stateToken = Settings::relayToken();
+
         return view('m365-mailer::cp.settings', [
             'configured' => $this->isConfigured($config),
             'isDefaultMailer' => config('mail.default') === 'microsoft-graph',
@@ -25,7 +28,9 @@ class SettingsController
             'relayUrl' => $config['relay_url'] ?? null,
             'relayCallback' => $this->relayCallbackUrl($config),
             'connection' => Settings::connection(),
-            'connected' => Settings::relayToken() !== null,
+            'connected' => filled($envToken) || $stateToken !== null,
+            // 'env' = durable (Secret); 'runtime' = state.json (needs a persistent volume)
+            'tokenSource' => filled($envToken) ? 'env' : ($stateToken !== null ? 'runtime' : null),
             'fromMailbox' => Settings::fromMailbox(),
         ]);
     }

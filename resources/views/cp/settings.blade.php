@@ -32,6 +32,12 @@
                 @endif
             </div>
 
+            @if ($tokenSource === 'runtime')
+                <div style="padding:.6rem .85rem; margin-bottom:1rem; border-radius:.5rem; background:#fff8e6; color:#7a5b00; border:1px solid #f3e2a8; font-size:.85rem;">
+                    {{ __('Token is stored in storage/m365-mailer/ — make sure that path is on a persistent volume, or set M365_RELAY_TOKEN (k8s Secret) so it survives redeploys.') }}
+                </div>
+            @endif
+
             <dl style="display: grid; grid-template-columns: 180px 1fr; gap: .4rem 1rem; font-size: .875rem; margin: 0;">
                 <dt style="color:#6b7280;">{{ __('Relay') }}</dt>
                 <dd style="margin:0; font-family: monospace;">{{ $relayUrl ?: '—' }}</dd>

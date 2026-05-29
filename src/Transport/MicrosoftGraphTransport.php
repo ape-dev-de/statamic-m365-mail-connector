@@ -24,6 +24,7 @@ class MicrosoftGraphTransport extends AbstractTransport
      */
     public function __construct(
         private readonly string $relayUrl,
+        private readonly ?string $relayToken = null,
         private readonly bool $saveToSentItems = false,
         private readonly ?\Closure $fromResolver = null,
     ) {
@@ -41,7 +42,8 @@ class MicrosoftGraphTransport extends AbstractTransport
             throw new TransportException('M365 mailer: message has no "From" address; it must be a mailbox in the connected tenant.');
         }
 
-        $token = Settings::relayToken();
+        // Durable env/Secret override wins; otherwise the token stored at consent.
+        $token = $this->relayToken ?: Settings::relayToken();
         if (! $token) {
             throw new TransportException('M365 mailer: not connected — grant admin consent in the Control Panel first.');
         }

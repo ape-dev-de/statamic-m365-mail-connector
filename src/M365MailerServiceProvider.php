@@ -50,6 +50,7 @@ class M365MailerServiceProvider extends AddonServiceProvider
 
             return new MicrosoftGraphTransport(
                 relayUrl: $config['relay_url'],
+                relayToken: $config['relay_token'] ?? null,
                 saveToSentItems: (bool) ($config['save_to_sent_items'] ?? false),
                 fromResolver: fn () => Settings::fromMailbox(),
             );
