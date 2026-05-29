@@ -109,6 +109,103 @@ function makeRevocationStore(path) {
   };
 }
 
+// Vault-KV-backed revocation store — shared across relay replicas (the file
+// store can't be: no RWX storage). Authenticates via Kubernetes auth (the pod's
+// ServiceAccount JWT), reads with a short stale-while-revalidate cache so /send
+// stays sync + network-free on the hot path, and writes with compare-and-set so
+// concurrent revokes of different tenants don't clobber each other.
+//
+// `version()` is sync (serves the cache, kicks a background refresh when stale);
+// `revoke()` is async (CAS read-modify-write against Vault).
+function makeVaultRevocationStore({
+  addr,
+  role,
+  kvPath = 'secret/m365-relay/revocations',
+  fetchImpl = fetch,
+  readSaToken = () => fs.readFileSync('/var/run/secrets/kubernetes.io/serviceaccount/token', 'utf8'),
+  cacheTtlMs = 15000,
+  now = () => Date.now(),
+}) {
+  const [mount, ...rest] = kvPath.split('/');
+  const dataUrl = `${addr}/v1/${mount}/data/${rest.join('/')}`; // KV v2 inserts /data/
+  const loginUrl = `${addr}/v1/auth/kubernetes/login`;
+
+  let token = null;
+  let tokenExp = 0;
+  let cache = {}; // tenant -> version
+  let kvVersion = 0; // KV v2 metadata version, for CAS
+  let lastFetch = 0;
+  let refreshing = null;
+
+  async function vaultToken() {
+    if (token && now() < tokenExp) return token;
+    const res = await fetchImpl(loginUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, jwt: readSaToken() }),
+    });
+    if (!res.ok) throw new Error(`vault login ${res.status}`);
+    const j = await res.json();
+    token = j.auth.client_token;
+    tokenExp = now() + Math.max(60, (j.auth.lease_duration || 3600) - 60) * 1000;
+    return token;
+  }
+
+  async function fetchMap() {
+    const res = await fetchImpl(dataUrl, { headers: { 'X-Vault-Token': await vaultToken() } });
+    if (res.status === 404) {
+      cache = {};
+      kvVersion = 0;
+      lastFetch = now();
+      return;
+    }
+    if (!res.ok) throw new Error(`vault read ${res.status}`);
+    const j = await res.json();
+    cache = (j.data && j.data.data) || {};
+    kvVersion = (j.data && j.data.metadata && j.data.metadata.version) || 0;
+    lastFetch = now();
+  }
+
+  function maybeRefresh() {
+    if (now() - lastFetch <= cacheTtlMs || refreshing) return;
+    refreshing = fetchMap()
+      .catch((e) => console.error('revocation refresh failed:', e.message))
+      .finally(() => {
+        refreshing = null;
+      });
+  }
+
+  return {
+    async init() {
+      await fetchMap();
+    },
+    version(tenant) {
+      maybeRefresh(); // stale-while-revalidate, never blocks /send
+      return Number(cache[tenant]) || 0;
+    },
+    async revoke(tenant) {
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await fetchMap(); // latest map + CAS version
+        const next = { ...cache, [tenant]: (Number(cache[tenant]) || 0) + 1 };
+        const res = await fetchImpl(dataUrl, {
+          method: 'POST',
+          headers: { 'X-Vault-Token': await vaultToken(), 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: next, options: { cas: kvVersion } }),
+        });
+        if (res.ok) {
+          cache = next;
+          kvVersion += 1;
+          lastFetch = now();
+          return next[tenant];
+        }
+        if (res.status === 400 || res.status === 409) continue; // CAS conflict — retry
+        throw new Error(`vault write ${res.status}`);
+      }
+      throw new Error('vault revoke: CAS retries exhausted');
+    },
+  };
+}
+
 // Per-tenant sliding-window rate limit (in-memory). Transient misuse guard: a
 // burst (e.g. a leaked token blasting mail) gets 429'd without a permanent lockout.
 function makeRateLimiter(max, windowSec) {
@@ -408,7 +505,7 @@ async function handleRevoke(req, res, config) {
     return res.end('tenant required');
   }
 
-  const version = config.revocations.revoke(tenant);
+  const version = await config.revocations.revoke(tenant);
   res.writeHead(200, { 'Content-Type': 'application/json' });
   return res.end(JSON.stringify({ tenant, version }));
 }
@@ -447,6 +544,7 @@ module.exports = {
   resolveTtlSec,
   verifyCapabilityToken,
   makeRevocationStore,
+  makeVaultRevocationStore,
   makeRateLimiter,
   parseState,
   originAllowed,
@@ -470,7 +568,7 @@ function requireEnv(name) {
   return v;
 }
 
-if (require.main === module) {
+async function main() {
   const PORT = process.env.PORT || 8080;
   const clientId = requireEnv('M365_CLIENT_ID');
   const certPath = requireEnv('M365_CERT_PEM_PATH');
@@ -489,6 +587,24 @@ if (require.main === module) {
   const { privateKey, x5t } = loadCert(fs.readFileSync(certPath, 'utf8'));
   const getToken = makeGraphTokenGetter(clientId, privateKey, x5t);
 
+  // Revocation store: Vault KV (shared across replicas) when VAULT_ADDR is set,
+  // else a local file (single-replica fallback). Kill switch: POST /admin/revoke.
+  let revocations;
+  if (process.env.VAULT_ADDR) {
+    revocations = makeVaultRevocationStore({
+      addr: process.env.VAULT_ADDR,
+      role: requireEnv('VAULT_ROLE'),
+      kvPath: process.env.REVOCATIONS_VAULT_PATH || 'secret/m365-relay/revocations',
+    });
+    try {
+      await revocations.init();
+    } catch (e) {
+      console.error('initial revocation load from Vault failed (continuing, will retry):', e.message);
+    }
+  } else {
+    revocations = makeRevocationStore(process.env.REVOCATIONS_PATH || '');
+  }
+
   const config = {
     signingSecret,
     allowedOrigins: new Set(allowed),
@@ -496,12 +612,18 @@ if (require.main === module) {
     maxTtlDays,
     getToken,
     fetchImpl: fetch,
-    // Revocation store (file-backed); kill switch via POST /admin/revoke.
-    revocations: makeRevocationStore(process.env.REVOCATIONS_PATH || ''),
+    revocations,
     adminSecret: process.env.RELAY_ADMIN_SECRET || '',
     // Transient misuse guard: max sends per tenant per window.
     rateLimiter: makeRateLimiter(Number(process.env.SEND_RATE_MAX) || 60, Number(process.env.SEND_RATE_WINDOW_SEC) || 60),
   };
 
   createServer(config).listen(PORT, () => console.log(`m365 mail relay listening on :${PORT}`));
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error('fatal:', e);
+    process.exit(1);
+  });
 }

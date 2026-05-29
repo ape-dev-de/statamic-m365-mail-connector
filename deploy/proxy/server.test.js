@@ -8,12 +8,42 @@ const http = require('node:http');
 const {
   makeCapabilityToken,
   verifyCapabilityToken,
+  makeVaultRevocationStore,
   parseState,
   originAllowed,
   loadCert,
   buildClientAssertion,
   createServer,
 } = require('./server');
+
+// In-memory fake Vault (KV v2 + k8s auth) for the revocation-store tests.
+function fakeVault() {
+  const backend = { map: {}, version: 0 };
+  const fetchImpl = async (url, opts = {}) => {
+    if (url.endsWith('/v1/auth/kubernetes/login')) {
+      return { ok: true, status: 200, json: async () => ({ auth: { client_token: 'vault-token', lease_duration: 3600 } }) };
+    }
+    if (url.endsWith('/v1/secret/data/m365-relay/revocations')) {
+      if ((opts.method || 'GET') === 'POST') {
+        const body = JSON.parse(opts.body);
+        if ((body.options && body.options.cas) !== backend.version) {
+          return { ok: false, status: 400, text: async () => 'check-and-set mismatch' };
+        }
+        backend.map = body.data;
+        backend.version += 1;
+        return { ok: true, status: 200, json: async () => ({ data: { metadata: { version: backend.version } } }) };
+      }
+      if (backend.version === 0) return { ok: false, status: 404, text: async () => 'not found' };
+      return { ok: true, status: 200, json: async () => ({ data: { data: backend.map, metadata: { version: backend.version } } }) };
+    }
+    throw new Error('unexpected vault url: ' + url);
+  };
+  return { backend, fetchImpl };
+}
+
+function vaultStore(fetchImpl) {
+  return makeVaultRevocationStore({ addr: 'http://vault', role: 'm365-relay', fetchImpl, readSaToken: () => 'fake-jwt' });
+}
 
 const SECRET = 'test-relay-signing-secret-0123456789';
 const ORIGIN = 'https://festglanz.de/cp/m365-mailer/callback';
@@ -72,7 +102,7 @@ IJT9Yq4E1Ro8i0ROEbIO
 
 test('capability token round-trips and yields its tenant', () => {
   const cap = makeCapabilityToken(TENANT, SECRET, 3600);
-  assert.deepEqual(verifyCapabilityToken(cap, SECRET), { tenant: TENANT });
+  assert.deepEqual(verifyCapabilityToken(cap, SECRET), { tenant: TENANT, ver: 0 });
 });
 
 test('a leaked cap is limited to ONE tenant (no cross-tenant)', () => {
@@ -188,7 +218,7 @@ test('consent: allow-listed origin -> 302 with a valid cap', async () => {
     assert.equal(loc.searchParams.get('tenant'), TENANT);
     const cap = loc.searchParams.get('cap');
     assert.ok(cap, 'cap present');
-    assert.deepEqual(verifyCapabilityToken(cap, SECRET), { tenant: TENANT });
+    assert.deepEqual(verifyCapabilityToken(cap, SECRET), { tenant: TENANT, ver: 0 });
   } finally {
     server.close();
   }
@@ -273,6 +303,62 @@ test('send: Graph failure propagates status + body', async () => {
     });
     assert.equal(r.status, 403);
     assert.match(await r.text(), /forbidden/);
+  } finally {
+    server.close();
+  }
+});
+
+// ---- Vault-backed revocation store ----
+
+test('vault revocation store: init, version, CAS revoke, persistence', async () => {
+  const { backend, fetchImpl } = fakeVault();
+  const store = vaultStore(fetchImpl);
+  await store.init();
+  assert.equal(store.version(TENANT), 0);
+
+  assert.equal(await store.revoke(TENANT), 1);
+  assert.equal(backend.map[TENANT], 1);
+  assert.equal(backend.version, 1); // CAS-persisted to Vault
+  assert.equal(store.version(TENANT), 1);
+
+  assert.equal(await store.revoke(TENANT), 2);
+  assert.equal(store.version(TENANT), 2);
+});
+
+test("vault store is shared across replicas (B sees A's revoke)", async () => {
+  const { fetchImpl } = fakeVault(); // one backend, two store instances
+  const a = vaultStore(fetchImpl);
+  const b = vaultStore(fetchImpl);
+  await a.init();
+  await b.init();
+  await a.revoke(TENANT); // replica A writes Vault
+  await b.init(); // replica B re-reads (stale-while-revalidate)
+  assert.equal(b.version(TENANT), 1);
+});
+
+test('send: cap older than the tenant revocation version -> 401', async () => {
+  const { fetchImpl } = fakeVault();
+  const store = vaultStore(fetchImpl);
+  await store.revoke(TENANT); // tenant now at version 1; cache warm
+
+  const { base, server, fetchCalls } = await startServer({ revocations: store });
+  try {
+    const stale = makeCapabilityToken(TENANT, SECRET, 3600, 0);
+    const r1 = await fetch(`${base}/send`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${stale}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'kontakt@festglanz.de', message: {} }),
+    });
+    assert.equal(r1.status, 401);
+    assert.equal(fetchCalls.length, 0, 'revoked cap must not reach Graph');
+
+    const fresh = makeCapabilityToken(TENANT, SECRET, 3600, 1);
+    const r2 = await fetch(`${base}/send`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${fresh}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'kontakt@festglanz.de', message: { subject: 'ok' } }),
+    });
+    assert.equal(r2.status, 202);
   } finally {
     server.close();
   }
