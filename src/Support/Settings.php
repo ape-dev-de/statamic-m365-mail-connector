@@ -59,4 +59,15 @@ class Settings
 
         return is_string($value) && $value !== '' ? $value : null;
     }
+
+    /**
+     * Requested token lifetime in days (0 = non-expiring). Sent to the relay at
+     * consent, which clamps it to its own ceiling. Default 730 (2 years).
+     */
+    public static function tokenTtlDays(): int
+    {
+        $value = self::get('token_ttl_days');
+
+        return is_int($value) ? $value : 730;
+    }
 }

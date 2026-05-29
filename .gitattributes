@@ -1,0 +1,7 @@
+# Keep the Composer package distributed to customer sites lean: the relay,
+# deploy tooling and tests are part of the monorepo but not the PHP addon.
+/deploy         export-ignore
+/tests          export-ignore
+/.github        export-ignore
+/.gitattributes export-ignore
+/.gitignore     export-ignore

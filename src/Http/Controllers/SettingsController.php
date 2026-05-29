@@ -32,6 +32,7 @@ class SettingsController
             // 'env' = durable (Secret); 'runtime' = state.json (needs a persistent volume)
             'tokenSource' => filled($envToken) ? 'env' : ($stateToken !== null ? 'runtime' : null),
             'fromMailbox' => Settings::fromMailbox(),
+            'tokenTtlDays' => Settings::tokenTtlDays(),
         ]);
     }
 
@@ -62,7 +63,7 @@ class SettingsController
         $url = "https://login.microsoftonline.com/{$tenant}/adminconsent?".http_build_query([
             'client_id' => $config['client_id'],
             'redirect_uri' => $this->relayCallbackUrl($config),
-            'state' => $this->encodeState(cp_route('m365-mailer.callback'), $nonce),
+            'state' => $this->encodeState(cp_route('m365-mailer.callback'), $nonce, Settings::tokenTtlDays()),
         ]);
 
         return redirect()->away($url);
@@ -126,6 +127,21 @@ class SettingsController
             : __('Sender mailbox saved: :address.', ['address' => $mailbox]));
     }
 
+    public function saveTtl(Request $request)
+    {
+        $this->authorizeSuper();
+
+        $days = (int) $request->input('token_ttl_days');
+
+        if (! in_array($days, [0, 365, 730, 1825], true)) {
+            return back()->with('error', __('Invalid token lifetime.'));
+        }
+
+        Settings::put(['token_ttl_days' => $days]);
+
+        return back()->with('success', __('Token lifetime saved. It applies at the next consent.'));
+    }
+
     public function test()
     {
         $this->authorizeSuper();
@@ -178,12 +194,13 @@ class SettingsController
     // state carries the return origin + a CSRF nonce. No signature here: the relay
     // guards open-redirect via its origin allowlist, and the nonce is validated
     // against this box's session on return.
-    private function encodeState(string $origin, string $nonce): string
+    private function encodeState(string $origin, string $nonce, int $ttlDays): string
     {
         return $this->b64UrlEncode(json_encode([
             'origin' => $origin,
             'nonce' => $nonce,
             'ts' => time(),
+            'ttl_days' => $ttlDays,
         ]));
     }
 

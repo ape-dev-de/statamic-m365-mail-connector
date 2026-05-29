@@ -83,6 +83,31 @@
             </form>
         </div>
 
+        <div style="background:#fff; border:1px solid #e3e8ef; border-radius:.75rem; padding:1.25rem 1.5rem; margin-bottom:1.25rem;">
+            <h2 style="font-size:1rem; margin:0 0 .25rem;">{{ __('Token lifetime') }}</h2>
+            <p style="color:#6b7280; font-size:.875rem; margin:0 0 .75rem;">
+                {{ __('How long the capability token stays valid. Applies at the next consent. The relay may cap this.') }}
+            </p>
+            <form method="POST" action="{{ cp_route('m365-mailer.ttl') }}" style="display:flex; gap:.5rem; align-items:center; margin:0;">
+                @csrf
+                <select name="token_ttl_days"
+                        style="flex:1; padding:.5rem .75rem; border:1px solid #d1d5db; border-radius:.5rem;">
+                    @foreach ([0 => __('Unlimited'), 365 => __('1 year'), 730 => __('2 years'), 1825 => __('5 years')] as $days => $label)
+                        <option value="{{ $days }}" {{ $tokenTtlDays === $days ? 'selected' : '' }}>{{ $label }}</option>
+                    @endforeach
+                </select>
+                <button type="submit"
+                        style="padding:.55rem 1.1rem; border-radius:.5rem; background:#111827; color:#fff; border:none; font-weight:600; cursor:pointer;">
+                    {{ __('Save') }}
+                </button>
+            </form>
+            @if ($tokenTtlDays === 0)
+                <p style="color:#9ca3af; font-size:.8125rem; margin:.6rem 0 0;">
+                    {{ __('Unlimited is safe only if the relay supports per-tenant revocation — otherwise a leaked token can only be killed by rotating the relay signing secret (affects all tenants).') }}
+                </p>
+            @endif
+        </div>
+
         <div style="display:flex; gap:.75rem; align-items:center;">
             <a href="{{ cp_route('m365-mailer.consent') }}"
                style="display:inline-block; padding:.55rem 1.1rem; border-radius:.5rem; background:#2563eb; color:#fff; text-decoration:none; font-weight:600; {{ $configured ? '' : 'opacity:.5; pointer-events:none;' }}">

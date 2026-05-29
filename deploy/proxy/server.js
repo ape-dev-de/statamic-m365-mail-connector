@@ -27,11 +27,22 @@ const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 // Capability tokens — cap = base64url(JSON {tenant,iat,exp}).base64url(HMAC)
 // ---------------------------------------------------------------------------
 
+// ttlSec falsy (0/null) => non-expiring token (advisable only with per-tenant revocation).
 function makeCapabilityToken(tenant, secret, ttlSec) {
   const now = Math.floor(Date.now() / 1000);
-  const body = Buffer.from(JSON.stringify({ tenant, iat: now, exp: now + ttlSec })).toString('base64url');
+  const payload = { tenant, iat: now };
+  if (ttlSec) payload.exp = now + ttlSec;
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
   return `${body}.${sig}`;
+}
+
+// Per-tenant lifetime chosen in the CP (state.ttl_days), clamped to operator policy:
+// maxTtlDays > 0 caps it AND forces a finite token; resolved 0 days => non-expiring.
+function resolveTtlSec(requestedDays, { defaultTtlDays, maxTtlDays }) {
+  let days = Number.isInteger(requestedDays) && requestedDays >= 0 ? requestedDays : defaultTtlDays;
+  if (maxTtlDays > 0 && (days === 0 || days > maxTtlDays)) days = maxTtlDays;
+  return days === 0 ? null : days * 24 * 3600;
 }
 
 function verifyCapabilityToken(cap, secret) {
@@ -51,8 +62,10 @@ function verifyCapabilityToken(cap, secret) {
   } catch {
     return null;
   }
-  if (!payload || typeof payload.tenant !== 'string' || typeof payload.exp !== 'number') return null;
-  if (Math.floor(Date.now() / 1000) >= payload.exp) return null;
+  if (!payload || typeof payload.tenant !== 'string') return null;
+  if (payload.exp !== undefined) {
+    if (typeof payload.exp !== 'number' || Math.floor(Date.now() / 1000) >= payload.exp) return null;
+  }
 
   return { tenant: payload.tenant };
 }
@@ -228,7 +241,8 @@ function handleCallback(req, res, url, config) {
       res.writeHead(400);
       return res.end('missing tenant');
     }
-    const cap = makeCapabilityToken(tenant, config.signingSecret, config.capTtlSec);
+    const ttlSec = resolveTtlSec(Number(parsed.ttl_days), config);
+    const cap = makeCapabilityToken(tenant, config.signingSecret, ttlSec);
     target.searchParams.set('admin_consent', 'True');
     target.searchParams.set('tenant', tenant);
     passthrough('state');
@@ -325,6 +339,7 @@ function createServer(config) {
 
 module.exports = {
   makeCapabilityToken,
+  resolveTtlSec,
   verifyCapabilityToken,
   parseState,
   originAllowed,
@@ -361,7 +376,8 @@ if (require.main === module) {
     console.error('ALLOWED_ORIGINS is required (comma-separated exact origins)');
     process.exit(1);
   }
-  const capTtlSec = (Number(process.env.CAP_TTL_DAYS) || 730) * 24 * 3600;
+  const defaultTtlDays = Number(process.env.CAP_TTL_DAYS) || 730;  // used when the CP sends no ttl_days
+  const maxTtlDays = Number(process.env.CAP_MAX_TTL_DAYS) || 0;    // 0 = no ceiling (unlimited allowed)
 
   const { privateKey, x5t } = loadCert(fs.readFileSync(certPath, 'utf8'));
   const getToken = makeGraphTokenGetter(clientId, privateKey, x5t);
@@ -369,7 +385,8 @@ if (require.main === module) {
   const config = {
     signingSecret,
     allowedOrigins: new Set(allowed),
-    capTtlSec,
+    defaultTtlDays,
+    maxTtlDays,
     getToken,
     fetchImpl: fetch,
   };
