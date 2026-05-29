@@ -16,7 +16,10 @@ class M365MailerServiceProvider extends AddonServiceProvider
         'cp' => __DIR__.'/../routes/cp.php',
     ];
 
-    protected $viewNamespace = 'm365-mailer';
+    protected $vite = [
+        'input' => ['resources/js/cp.js'],
+        'publicDirectory' => 'resources/dist',
+    ];
 
     public function boot()
     {

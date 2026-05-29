@@ -6,6 +6,7 @@ use ApeDev\M365Mailer\Support\Settings;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Str;
+use Inertia\Inertia;
 use Statamic\Facades\User;
 
 class SettingsController
@@ -19,20 +20,22 @@ class SettingsController
         $envToken = $config['relay_token'] ?? null;
         $stateToken = Settings::relayToken();
 
-        return view('m365-mailer::cp.settings', [
+        return Inertia::render('m365-mailer::Settings', [
             'configured' => $this->isConfigured($config),
-            'isDefaultMailer' => config('mail.default') === 'microsoft-graph',
-            'clientId' => $config['client_id'] ?? null,
+            'connected' => filled($envToken) || $stateToken !== null,
+            'connection' => Settings::connection(),
+            'relayUrl' => $config['relay_url'] ?? null,
             'tenantId' => $config['tenant_id'] ?? null,
             'fromAddress' => config('mail.from.address'),
-            'relayUrl' => $config['relay_url'] ?? null,
-            'relayCallback' => $this->relayCallbackUrl($config),
-            'connection' => Settings::connection(),
-            'connected' => filled($envToken) || $stateToken !== null,
+            'isDefaultMailer' => config('mail.default') === 'microsoft-graph',
             // 'env' = durable (Secret); 'runtime' = state.json (needs a persistent volume)
             'tokenSource' => filled($envToken) ? 'env' : ($stateToken !== null ? 'runtime' : null),
-            'fromMailbox' => Settings::fromMailbox(),
             'tokenTtlDays' => Settings::tokenTtlDays(),
+            'urls' => [
+                'consent' => cp_route('m365-mailer.consent'),
+                'test' => cp_route('m365-mailer.test'),
+                'ttl' => cp_route('m365-mailer.ttl'),
+            ],
         ]);
     }
 
@@ -106,23 +109,6 @@ class SettingsController
 
         return redirect()->route('statamic.cp.m365-mailer.index')
             ->with('success', __('Microsoft 365 connected — admin consent granted.'));
-    }
-
-    public function saveMailbox(Request $request)
-    {
-        $this->authorizeSuper();
-
-        $mailbox = trim((string) $request->input('from_mailbox'));
-
-        if ($mailbox !== '' && ! filter_var($mailbox, FILTER_VALIDATE_EMAIL)) {
-            return back()->with('error', __('Enter a valid email address, or leave empty for "all / decide per form".'));
-        }
-
-        Settings::put(['from_mailbox' => $mailbox ?: null]);
-
-        return back()->with('success', $mailbox === ''
-            ? __('Sender set to "all / decide per form".')
-            : __('Sender mailbox saved: :address.', ['address' => $mailbox]));
     }
 
     public function saveTtl(Request $request)
