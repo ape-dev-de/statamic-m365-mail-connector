@@ -510,6 +510,24 @@ async function handleRevoke(req, res, config) {
   return res.end(JSON.stringify({ tenant, version }));
 }
 
+// GET /agb — serves the static terms & privacy page (read once, then cached).
+let agbHtml = null;
+function handleAgb(res) {
+  if (agbHtml === null) {
+    try {
+      agbHtml = fs.readFileSync(`${__dirname}/agb.html`, 'utf8');
+    } catch {
+      agbHtml = '';
+    }
+  }
+  if (!agbHtml) {
+    res.writeHead(404);
+    return res.end('not found');
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  return res.end(agbHtml);
+}
+
 function createServer(config) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -517,6 +535,9 @@ function createServer(config) {
     if (req.method === 'GET' && url.pathname === '/health') {
       res.writeHead(200);
       return res.end('ok');
+    }
+    if (req.method === 'GET' && url.pathname === '/agb') {
+      return handleAgb(res);
     }
     if (req.method === 'GET' && url.pathname === '/callback') {
       return handleCallback(req, res, url, config);

@@ -3,7 +3,7 @@ FROM node:22-alpine
 WORKDIR /app
 # package.json pins type:commonjs (the repo root is type:module); server.test.js
 # is intentionally NOT copied into the image.
-COPY package.json server.js ./
+COPY package.json server.js agb.html ./
 
 ENV PORT=8080
 EXPOSE 8080
