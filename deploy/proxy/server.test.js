@@ -11,6 +11,7 @@ const {
   makeVaultRevocationStore,
   parseState,
   originAllowed,
+  hostAllowedByDomains,
   loadCert,
   buildClientAssertion,
   createServer,
@@ -142,6 +143,16 @@ test('originAllowed: exact-match https only', () => {
   assert.equal(originAllowed('http://festglanz.de/cp/m365-mailer/callback', allow), false); // not listed + not https
 });
 
+test('hostAllowedByDomains: https host == or subdomain of a verified domain', () => {
+  const domains = ['festglanz.de', 'ape-dev.de'];
+  assert.equal(hostAllowedByDomains('https://festglanz.de/cp/m365-mailer/callback', domains), true);
+  assert.equal(hostAllowedByDomains('https://www.festglanz.de/cp/m365-mailer/callback', domains), true); // subdomain
+  assert.equal(hostAllowedByDomains('https://evil.com/cb', domains), false); // not verified
+  assert.equal(hostAllowedByDomains('https://notfestglanz.de/cb', domains), false); // not a real suffix match
+  assert.equal(hostAllowedByDomains('http://festglanz.de/cb', domains), false); // not https
+  assert.equal(hostAllowedByDomains('https://festglanz.de/cb', []), false); // no verified domains
+});
+
 // ---- certificate client assertion ----
 
 test('buildClientAssertion: RS256 + x5t header, verifiable signature', () => {
@@ -233,6 +244,72 @@ test('consent: non-allow-listed origin -> 400, no redirect', async () => {
     });
     assert.equal(r.status, 400);
     assert.equal(r.headers.get('location'), null);
+  } finally {
+    server.close();
+  }
+});
+
+// fetchImpl that answers the Graph /domains call (verified-domains path) and
+// 202s everything else (so /send tests still pass if reused).
+function graphDomainsFetch(domains) {
+  return async (url, opts) => {
+    if (url.includes('/domains')) {
+      return { ok: true, status: 200, json: async () => ({ value: domains }) };
+    }
+    return { status: 202, headers: { get: () => null }, text: async () => '' };
+  };
+}
+
+test('consent: origin NOT in static allowlist but a verified tenant domain -> 302', async () => {
+  const { base, server } = await startServer({
+    allowedOrigins: new Set(), // force the verified-domains path
+    getToken: async () => 'tok',
+    fetchImpl: graphDomainsFetch([
+      { id: 'festglanz.de', isVerified: true },
+      { id: 'ape-dev.de', isVerified: true },
+    ]),
+  });
+  try {
+    const r = await fetch(`${base}/callback?admin_consent=True&tenant=${TENANT}&state=${stateFor(ORIGIN)}`, {
+      redirect: 'manual',
+    });
+    assert.equal(r.status, 302);
+    const loc = new URL(r.headers.get('location'));
+    assert.equal(`${loc.origin}${loc.pathname}`, ORIGIN);
+    assert.ok(loc.searchParams.get('cap'), 'cap present');
+  } finally {
+    server.close();
+  }
+});
+
+test('consent: origin host not a verified domain (and not allow-listed) -> 400', async () => {
+  const { base, server } = await startServer({
+    allowedOrigins: new Set(),
+    getToken: async () => 'tok',
+    fetchImpl: graphDomainsFetch([{ id: 'someone-else.de', isVerified: true }]),
+  });
+  try {
+    const r = await fetch(`${base}/callback?admin_consent=True&tenant=${TENANT}&state=${stateFor(ORIGIN)}`, {
+      redirect: 'manual',
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.headers.get('location'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('consent: unverified domain entry is ignored -> 400', async () => {
+  const { base, server } = await startServer({
+    allowedOrigins: new Set(),
+    getToken: async () => 'tok',
+    fetchImpl: graphDomainsFetch([{ id: 'festglanz.de', isVerified: false }]),
+  });
+  try {
+    const r = await fetch(`${base}/callback?admin_consent=True&tenant=${TENANT}&state=${stateFor(ORIGIN)}`, {
+      redirect: 'manual',
+    });
+    assert.equal(r.status, 400);
   } finally {
     server.close();
   }

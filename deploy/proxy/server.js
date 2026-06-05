@@ -223,7 +223,12 @@ function makeRateLimiter(max, windowSec) {
 
 // ---------------------------------------------------------------------------
 // Consent state — base64url(JSON {origin,nonce,ts}), UNSIGNED. The origin is
-// only trusted AFTER an exact-match allowlist + https check.
+// only trusted AFTER authorization: either an exact-match static allowlist
+// (ALLOWED_ORIGINS, backward-compat) OR — dynamically — a domain VERIFIED in the
+// tenant that is currently giving admin consent (Microsoft Graph /domains). The
+// latter removes per-customer allowlist maintenance: any site whose domain the
+// consenting tenant has verified in M365 is trusted, and only that tenant.
+// Requires the app to hold the Domain.Read.All application permission.
 // ---------------------------------------------------------------------------
 
 function parseState(state) {
@@ -248,6 +253,63 @@ function isHttps(origin) {
 
 function originAllowed(origin, allowedOrigins) {
   return allowedOrigins.has(origin) && isHttps(origin);
+}
+
+// True if the origin is https and its host equals — or is a subdomain of — a
+// domain the consenting tenant has verified in Microsoft 365.
+function hostAllowedByDomains(origin, verifiedDomains) {
+  let host;
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== 'https:') return false;
+    host = u.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return verifiedDomains.some((d) => host === d || host.endsWith('.' + d));
+}
+
+// App-only Graph read of the tenant's verified domains. Returns lowercased
+// domain names (e.g. ["festglanz.de", "ape-dev.de"]). Needs Domain.Read.All.
+async function fetchVerifiedDomains(tenant, getToken, fetchImpl = fetch) {
+  const token = await getToken(tenant);
+  const res = await fetchImpl(`${GRAPH_BASE}/domains?$select=id,isVerified`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!res.ok) throw new Error(`graph domains ${res.status}`);
+  const json = await res.json();
+  return (json.value || [])
+    .filter((d) => d.isVerified)
+    .map((d) => String(d.id).toLowerCase());
+}
+
+// Per-tenant cache around fetchVerifiedDomains (consent callbacks are rare; a
+// short TTL keeps the relay from hitting Graph on every retry).
+function makeVerifiedDomainsGetter(getToken, fetchImpl = fetch, ttlMs = 300000, now = () => Date.now()) {
+  const cache = new Map(); // tenant -> { domains, exp }
+  return async function getVerifiedDomains(tenant) {
+    const hit = cache.get(tenant);
+    if (hit && now() < hit.exp) return hit.domains;
+    const domains = await fetchVerifiedDomains(tenant, getToken, fetchImpl);
+    cache.set(tenant, { domains, exp: now() + ttlMs });
+    return domains;
+  };
+}
+
+// Authorize a return origin: static allowlist first (backward-compat), then the
+// consenting tenant's Graph-verified domains. Never throws — a Graph failure
+// just means "not authorized via domains" (the static allowlist still applies).
+async function isOriginAuthorized(origin, tenant, config) {
+  if (originAllowed(origin, config.allowedOrigins)) return true;
+  if (!tenant) return false;
+  const getter =
+    config.getVerifiedDomains || ((t) => fetchVerifiedDomains(t, config.getToken, config.fetchImpl));
+  try {
+    return hostAllowedByDomains(origin, await getter(tenant));
+  } catch (e) {
+    console.error('verified-domains check failed:', e.message);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +418,7 @@ function readJson(req, limit = 1 << 20) {
   });
 }
 
-function handleCallback(req, res, url, config) {
+async function handleCallback(req, res, url, config) {
   const state = url.searchParams.get('state');
   const parsed = parseState(state);
   if (!parsed) {
@@ -364,9 +426,12 @@ function handleCallback(req, res, url, config) {
     return res.end('invalid state');
   }
 
+  const tenant = url.searchParams.get('tenant');
+
   // Open-redirect / token-exfil guard: never redirect (let alone carry a cap)
-  // to an origin we don't explicitly trust.
-  if (!originAllowed(parsed.origin, config.allowedOrigins)) {
+  // to an origin we don't trust — static allowlist OR a domain verified in the
+  // consenting tenant.
+  if (!(await isOriginAuthorized(parsed.origin, tenant, config))) {
     res.writeHead(400);
     return res.end('origin not allowed');
   }
@@ -387,7 +452,6 @@ function handleCallback(req, res, url, config) {
   }
 
   if (url.searchParams.get('admin_consent') === 'True') {
-    const tenant = url.searchParams.get('tenant');
     if (!tenant) {
       res.writeHead(400);
       return res.end('missing tenant');
@@ -540,7 +604,10 @@ function createServer(config) {
       return handleAgb(res);
     }
     if (req.method === 'GET' && url.pathname === '/callback') {
-      return handleCallback(req, res, url, config);
+      return handleCallback(req, res, url, config).catch(() => {
+        if (!res.headersSent) res.writeHead(500);
+        res.end('internal error');
+      });
     }
     if (req.method === 'POST' && url.pathname === '/send') {
       return handleSend(req, res, config).catch(() => {
@@ -569,6 +636,10 @@ module.exports = {
   makeRateLimiter,
   parseState,
   originAllowed,
+  hostAllowedByDomains,
+  fetchVerifiedDomains,
+  makeVerifiedDomainsGetter,
+  isOriginAuthorized,
   loadCert,
   buildClientAssertion,
   makeGraphTokenGetter,
@@ -598,9 +669,11 @@ async function main() {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  // ALLOWED_ORIGINS is now an optional static fallback — origins are also
+  // authorized dynamically against the consenting tenant's Graph-verified
+  // domains (Domain.Read.All). Empty is fine when relying purely on that.
   if (allowed.length === 0) {
-    console.error('ALLOWED_ORIGINS is required (comma-separated exact origins)');
-    process.exit(1);
+    console.warn('ALLOWED_ORIGINS empty — authorizing origins via tenant verified domains only');
   }
   const defaultTtlDays = Number(process.env.CAP_TTL_DAYS) || 730;  // used when the CP sends no ttl_days
   const maxTtlDays = Number(process.env.CAP_MAX_TTL_DAYS) || 0;    // 0 = no ceiling (unlimited allowed)
@@ -632,6 +705,7 @@ async function main() {
     defaultTtlDays,
     maxTtlDays,
     getToken,
+    getVerifiedDomains: makeVerifiedDomainsGetter(getToken, fetch),
     fetchImpl: fetch,
     revocations,
     adminSecret: process.env.RELAY_ADMIN_SECRET || '',
