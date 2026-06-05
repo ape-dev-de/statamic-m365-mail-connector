@@ -55,8 +55,14 @@ class SettingsController
         // then uses that GUID to send). An explicit M365_TENANT_ID overrides.
         $tenant = ($config['tenant_id'] ?? null) ?: 'common';
 
+        // Nonce adds per-request entropy to the state; it is carried inside the
+        // HMAC-signed state and validated by signature on return — NOT stored in
+        // the session. The consent callback returns cross-site (Microsoft → relay
+        // on a different domain → this CP), where the session cookie is not
+        // reliably sent (SameSite/strict-privacy browsers), so a session-bound
+        // nonce produced spurious "state mismatch". The signature makes validation
+        // stateless and cookie-independent.
         $nonce = Str::random(40);
-        $request->session()->put('m365_consent_nonce', $nonce);
 
         // redirect_uri = the relay (registered once on the app). The relay verifies
         // the return origin against its allowlist, mints a per-tenant capability
@@ -74,12 +80,14 @@ class SettingsController
     {
         $this->authorizeSuper();
 
-        $nonce = $request->session()->pull('m365_consent_nonce');
+        // Stateless validation: decodeState() verifies the HMAC signature (keyed
+        // by APP_KEY) and freshness. No session lookup — the cross-site callback
+        // cannot rely on the session cookie being present.
         $payload = $this->decodeState((string) $request->query('state'));
 
-        if (! $nonce || ! $payload || ! hash_equals($nonce, $payload['nonce'] ?? '')) {
+        if (! $payload) {
             return redirect()->route('statamic.cp.m365-mailer.index')
-                ->with('error', __('Consent state mismatch — please retry.'));
+                ->with('error', __('Consent state invalid or expired — please retry.'));
         }
 
         if ($request->filled('error')) {
@@ -168,28 +176,61 @@ class SettingsController
         abort_unless(User::current()?->isSuper(), 403);
     }
 
-    // state carries the return origin + a CSRF nonce. No signature here: the relay
-    // guards open-redirect via its origin allowlist, and the nonce is validated
-    // against this box's session on return.
+    // state carries the return origin + a nonce, HMAC-SHA256 signed with APP_KEY.
+    // The signature lets the callback validate the state WITHOUT a session (the
+    // cross-domain Microsoft → relay → CP round-trip cannot rely on the session
+    // cookie). Format: "<b64url(payload-json)>.<b64url(hmac)>".
     private function encodeState(string $origin, string $nonce, int $ttlDays): string
     {
-        return $this->b64UrlEncode(json_encode([
+        $body = $this->b64UrlEncode(json_encode([
             'origin' => $origin,
             'nonce' => $nonce,
             'ts' => time(),
             'ttl_days' => $ttlDays,
         ]));
+
+        return $body.'.'.$this->signBody($body);
     }
 
     private function decodeState(string $state): ?array
     {
-        $payload = json_decode($this->b64UrlDecode($state), true);
+        $parts = explode('.', $state, 2);
+
+        if (count($parts) !== 2) {
+            return null;
+        }
+
+        [$body, $signature] = $parts;
+
+        if (! hash_equals($this->signBody($body), $signature)) {
+            return null;
+        }
+
+        $payload = json_decode($this->b64UrlDecode($body), true);
 
         if (! is_array($payload) || (time() - ($payload['ts'] ?? 0)) > 3600) {
             return null;
         }
 
         return $payload;
+    }
+
+    private function signBody(string $body): string
+    {
+        return $this->b64UrlEncode(hash_hmac('sha256', $body, $this->stateKey(), true));
+    }
+
+    // APP_KEY is the signing secret. Laravel stores it as "base64:<...>"; decode
+    // to the raw bytes so the key matches what the framework's encrypter uses.
+    private function stateKey(): string
+    {
+        $key = (string) config('app.key');
+
+        if (str_starts_with($key, 'base64:')) {
+            $key = base64_decode(substr($key, 7)) ?: $key;
+        }
+
+        return $key;
     }
 
     private function b64UrlEncode(string $value): string
