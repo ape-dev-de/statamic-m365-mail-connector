@@ -176,48 +176,56 @@ class SettingsController
         abort_unless(User::current()?->isSuper(), 403);
     }
 
-    // state carries the return origin + a nonce, HMAC-SHA256 signed with APP_KEY.
-    // The signature lets the callback validate the state WITHOUT a session (the
-    // cross-domain Microsoft → relay → CP round-trip cannot rely on the session
-    // cookie). Format: "<b64url(payload-json)>.<b64url(hmac)>".
+    // state carries the return origin + a nonce, with an HMAC-SHA256 signature
+    // (keyed by APP_KEY) embedded AS A FIELD inside the JSON. The whole thing is
+    // a single base64url(JSON) blob — so the relay's parseState (base64url→JSON,
+    // reads `origin`) keeps working and forwards the blob verbatim, while this CP
+    // verifies the signature on return WITHOUT a session (the cross-domain
+    // Microsoft → relay → CP callback cannot rely on the session cookie).
+    //
+    // NB: the signature must NOT be appended outside the JSON (e.g. "blob.sig"):
+    // the relay base64url-decodes the entire state and would fail to parse it.
     private function encodeState(string $origin, string $nonce, int $ttlDays): string
     {
-        $body = $this->b64UrlEncode(json_encode([
+        $payload = [
             'origin' => $origin,
             'nonce' => $nonce,
             'ts' => time(),
             'ttl_days' => $ttlDays,
-        ]));
+        ];
 
-        return $body.'.'.$this->signBody($body);
+        $payload['sig'] = $this->signPayload($payload);
+
+        return $this->b64UrlEncode(json_encode($payload));
     }
 
     private function decodeState(string $state): ?array
     {
-        $parts = explode('.', $state, 2);
+        $payload = json_decode($this->b64UrlDecode($state), true);
 
-        if (count($parts) !== 2) {
+        if (! is_array($payload) || ! isset($payload['sig'])) {
             return null;
         }
 
-        [$body, $signature] = $parts;
+        $signature = $payload['sig'];
+        unset($payload['sig']);
 
-        if (! hash_equals($this->signBody($body), $signature)) {
+        // Recompute over the payload sans `sig`. json_decode preserves key order,
+        // so this re-encodes byte-identically to what encodeState() signed.
+        if (! hash_equals($this->signPayload($payload), $signature)) {
             return null;
         }
 
-        $payload = json_decode($this->b64UrlDecode($body), true);
-
-        if (! is_array($payload) || (time() - ($payload['ts'] ?? 0)) > 3600) {
+        if ((time() - ($payload['ts'] ?? 0)) > 3600) {
             return null;
         }
 
         return $payload;
     }
 
-    private function signBody(string $body): string
+    private function signPayload(array $payload): string
     {
-        return $this->b64UrlEncode(hash_hmac('sha256', $body, $this->stateKey(), true));
+        return $this->b64UrlEncode(hash_hmac('sha256', json_encode($payload), $this->stateKey(), true));
     }
 
     // APP_KEY is the signing secret. Laravel stores it as "base64:<...>"; decode
