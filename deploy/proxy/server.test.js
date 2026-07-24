@@ -10,7 +10,7 @@ const {
   verifyCapabilityToken,
   makeVaultRevocationStore,
   parseState,
-  originAllowed,
+  domainMatches,
   hostAllowedByDomains,
   loadCert,
   buildClientAssertion,
@@ -136,11 +136,12 @@ test('parseState decodes origin; garbage -> null', () => {
   assert.equal(parseState(''), null);
 });
 
-test('originAllowed: exact-match https only', () => {
-  const allow = new Set([ORIGIN]);
-  assert.equal(originAllowed(ORIGIN, allow), true);
-  assert.equal(originAllowed('https://evil.com/cb', allow), false); // not listed
-  assert.equal(originAllowed('http://festglanz.de/cp/m365-mailer/callback', allow), false); // not listed + not https
+test('domainMatches: exact or subdomain, case-insensitive', () => {
+  const domains = ['festglanz.de', 'ape-dev.de'];
+  assert.equal(domainMatches('festglanz.de', domains), true);
+  assert.equal(domainMatches('MAIL.Festglanz.DE', domains), true); // subdomain, case-insensitive
+  assert.equal(domainMatches('notfestglanz.de', domains), false); // not a real suffix match
+  assert.equal(domainMatches('evil.com', domains), false);
 });
 
 test('hostAllowedByDomains: https host == or subdomain of a verified domain', () => {
@@ -185,7 +186,9 @@ function startServer(overrides = {}) {
   const fetchCalls = [];
   const config = {
     signingSecret: SECRET,
-    allowedOrigins: new Set([ORIGIN]),
+    // festglanz.de is the accepted (Graph-verified) domain of the test tenant;
+    // origin auth + the /send From-guard both resolve against this.
+    getVerifiedDomains: async () => ['festglanz.de'],
     capTtlSec: 3600,
     getToken: async () => 'fake-graph-token',
     fetchImpl: async (url, opts) => {
@@ -217,7 +220,7 @@ test('GET /health -> ok', async () => {
   }
 });
 
-test('consent: allow-listed origin -> 302 with a valid cap', async () => {
+test('consent: origin is a verified tenant domain -> 302 with a valid cap', async () => {
   const { base, server } = await startServer();
   try {
     const url = `${base}/callback?admin_consent=True&tenant=${TENANT}&state=${stateFor(ORIGIN)}`;
@@ -235,7 +238,7 @@ test('consent: allow-listed origin -> 302 with a valid cap', async () => {
   }
 });
 
-test('consent: non-allow-listed origin -> 400, no redirect', async () => {
+test('consent: origin not a verified tenant domain -> 400, no redirect', async () => {
   const { base, server } = await startServer();
   try {
     const evil = 'https://evil.example/cb';
@@ -260,9 +263,9 @@ function graphDomainsFetch(domains) {
   };
 }
 
-test('consent: origin NOT in static allowlist but a verified tenant domain -> 302', async () => {
+test('consent: verified tenant domain via the live Graph /domains path -> 302', async () => {
   const { base, server } = await startServer({
-    allowedOrigins: new Set(), // force the verified-domains path
+    getVerifiedDomains: undefined, // force the fallback → fetchVerifiedDomains(fetchImpl)
     getToken: async () => 'tok',
     fetchImpl: graphDomainsFetch([
       { id: 'festglanz.de', isVerified: true },
@@ -282,9 +285,9 @@ test('consent: origin NOT in static allowlist but a verified tenant domain -> 30
   }
 });
 
-test('consent: origin host not a verified domain (and not allow-listed) -> 400', async () => {
+test('consent: origin host not a verified tenant domain -> 400', async () => {
   const { base, server } = await startServer({
-    allowedOrigins: new Set(),
+    getVerifiedDomains: undefined,
     getToken: async () => 'tok',
     fetchImpl: graphDomainsFetch([{ id: 'someone-else.de', isVerified: true }]),
   });
@@ -299,9 +302,9 @@ test('consent: origin host not a verified domain (and not allow-listed) -> 400',
   }
 });
 
-test('consent: unverified domain entry is ignored -> 400', async () => {
+test('consent: an isVerified:false domain entry is ignored -> 400', async () => {
   const { base, server } = await startServer({
-    allowedOrigins: new Set(),
+    getVerifiedDomains: undefined,
     getToken: async () => 'tok',
     fetchImpl: graphDomainsFetch([{ id: 'festglanz.de', isVerified: false }]),
   });
@@ -315,15 +318,30 @@ test('consent: unverified domain entry is ignored -> 400', async () => {
   }
 });
 
-test('consent error is forwarded without a cap', async () => {
-  const { base, server } = await startServer();
+test('consent error is forwarded (to a verified origin) without a cap', async () => {
+  const { base, server } = await startServer(); // accepted domain: festglanz.de (= ORIGIN host)
   try {
-    const url = `${base}/callback?error=access_denied&error_description=nope&state=${stateFor(ORIGIN)}`;
+    const url = `${base}/callback?error=access_denied&error_description=nope&tenant=${TENANT}&state=${stateFor(ORIGIN)}`;
     const r = await fetch(url, { redirect: 'manual' });
     assert.equal(r.status, 302);
     const loc = new URL(r.headers.get('location'));
     assert.equal(loc.searchParams.get('error'), 'access_denied');
     assert.equal(loc.searchParams.get('cap'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('consent: error callback without a resolvable tenant -> 400 (no redirect to an unverifiable origin)', async () => {
+  const { base, server } = await startServer();
+  try {
+    // No tenant → the origin cannot be authorized against accepted domains, so
+    // the relay refuses to redirect anywhere (avoids an open-redirect), even for
+    // an error that carries no capability token.
+    const url = `${base}/callback?error=access_denied&state=${stateFor(ORIGIN)}`;
+    const r = await fetch(url, { redirect: 'manual' });
+    assert.equal(r.status, 400);
+    assert.equal(r.headers.get('location'), null);
   } finally {
     server.close();
   }
@@ -343,6 +361,60 @@ test('send: valid cap -> 202 and Graph called for the from mailbox', async () =>
     assert.ok(fetchCalls[0].url.endsWith('/users/kontakt%40festglanz.de/sendMail'));
     assert.equal(fetchCalls[0].opts.headers.Authorization, 'Bearer fake-graph-token');
     assert.match(fetchCalls[0].opts.body, /"subject":"hi"/);
+  } finally {
+    server.close();
+  }
+});
+
+test('send: from domain NOT an accepted tenant domain -> 403, Graph not called', async () => {
+  const { base, server, fetchCalls } = await startServer({
+    getVerifiedDomains: async () => ['ape-dev.de'], // festglanz.de is NOT accepted here
+  });
+  try {
+    const cap = makeCapabilityToken(TENANT, SECRET, 3600);
+    const r = await fetch(`${base}/send`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cap}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'kontakt@festglanz.de', message: { subject: 'x' } }),
+    });
+    assert.equal(r.status, 403);
+    assert.equal(fetchCalls.length, 0, 'a spoofed/foreign From must not reach Graph sendMail');
+  } finally {
+    server.close();
+  }
+});
+
+test('send: from an accepted SUBDOMAIN -> 202', async () => {
+  const { base, server } = await startServer(); // accepted: festglanz.de
+  try {
+    const cap = makeCapabilityToken(TENANT, SECRET, 3600);
+    const r = await fetch(`${base}/send`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cap}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'noreply@mail.festglanz.de', message: { subject: 'x' } }),
+    });
+    assert.equal(r.status, 202);
+  } finally {
+    server.close();
+  }
+});
+
+test('send: accepted-domains lookup failure falls through to Graph fencing -> 202', async () => {
+  const { base, server, fetchCalls } = await startServer({
+    getVerifiedDomains: async () => {
+      throw new Error('graph /domains down');
+    },
+  });
+  try {
+    const cap = makeCapabilityToken(TENANT, SECRET, 3600);
+    const r = await fetch(`${base}/send`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${cap}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: 'kontakt@festglanz.de', message: { subject: 'x' } }),
+    });
+    // Degrades gracefully: the tenant-scoped Graph token still fences foreign mailboxes.
+    assert.equal(r.status, 202);
+    assert.equal(fetchCalls.length, 1, 'only the sendMail call');
   } finally {
     server.close();
   }

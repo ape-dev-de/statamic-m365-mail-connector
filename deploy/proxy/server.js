@@ -243,30 +243,26 @@ function parseState(state) {
   return payload;
 }
 
-function isHttps(origin) {
-  try {
-    return new URL(origin).protocol === 'https:';
-  } catch {
-    return false;
-  }
+// True if `host` equals — or is a subdomain of — a domain the tenant has
+// verified (accepted) in Microsoft 365. Shared by the consent origin check and
+// the /send From-domain guard.
+function domainMatches(host, verifiedDomains) {
+  host = String(host).toLowerCase();
+  return verifiedDomains.some((d) => host === d || host.endsWith('.' + d));
 }
 
-function originAllowed(origin, allowedOrigins) {
-  return allowedOrigins.has(origin) && isHttps(origin);
-}
-
-// True if the origin is https and its host equals — or is a subdomain of — a
-// domain the consenting tenant has verified in Microsoft 365.
+// True if the origin is https and its host is (a subdomain of) a verified
+// tenant domain.
 function hostAllowedByDomains(origin, verifiedDomains) {
   let host;
   try {
     const u = new URL(origin);
     if (u.protocol !== 'https:') return false;
-    host = u.hostname.toLowerCase();
+    host = u.hostname;
   } catch {
     return false;
   }
-  return verifiedDomains.some((d) => host === d || host.endsWith('.' + d));
+  return domainMatches(host, verifiedDomains);
 }
 
 // App-only Graph read of the tenant's verified domains. Returns lowercased
@@ -296,11 +292,14 @@ function makeVerifiedDomainsGetter(getToken, fetchImpl = fetch, ttlMs = 300000, 
   };
 }
 
-// Authorize a return origin: static allowlist first (backward-compat), then the
-// consenting tenant's Graph-verified domains. Never throws — a Graph failure
-// just means "not authorized via domains" (the static allowlist still applies).
+// Authorize a return origin SOLELY by the consenting tenant's Graph-verified
+// (accepted) domains. The request origin is attacker-controllable (it rides in
+// an unsigned state blob) and therefore spoofable, so a hand-maintained static
+// allowlist adds maintenance without real assurance — an attacker still cannot
+// make their origin a verified domain in the victim's tenant. Never throws: a
+// Graph failure is treated as "not authorized" (fail closed; consent is a rare
+// admin action, so a transient outage just means "retry the connect").
 async function isOriginAuthorized(origin, tenant, config) {
-  if (originAllowed(origin, config.allowedOrigins)) return true;
   if (!tenant) return false;
   const getter =
     config.getVerifiedDomains || ((t) => fetchVerifiedDomains(t, config.getToken, config.fetchImpl));
@@ -502,11 +501,29 @@ async function handleSend(req, res, config) {
   }
 
   const { from, message, saveToSentItems } = body || {};
-  // `from` cross-tenant is also fenced naturally: the Graph token below is
-  // scoped to the capability's tenant, so sending as a foreign mailbox fails.
   if (typeof from !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(from) || !message || typeof message !== 'object') {
     res.writeHead(400);
     return res.end('from (mailbox) and message are required');
+  }
+
+  // Anti-spam / anti-spoof: the From domain MUST be an accepted (Graph-verified)
+  // domain of the capability token's TENANT. The token — not the spoofable
+  // request origin — is the trust anchor here, so a leaked token cannot send as
+  // an arbitrary or look-alike domain. A definitive "not accepted" is a hard
+  // 403; if the domain list can't be fetched we fall through to Graph's own
+  // fencing (the tenant-scoped app token below can only send as a mailbox in the
+  // tenant), so a transient Graph/domains outage degrades gracefully instead of
+  // blocking all mail.
+  const getVerified =
+    config.getVerifiedDomains || ((t) => fetchVerifiedDomains(t, config.getToken, config.fetchImpl));
+  const fromDomain = from.slice(from.lastIndexOf('@') + 1);
+  try {
+    if (!domainMatches(fromDomain, await getVerified(claims.tenant))) {
+      res.writeHead(403);
+      return res.end('from domain is not an accepted domain of the tenant');
+    }
+  } catch (e) {
+    console.warn(`accepted-domains check unavailable for tenant ${claims.tenant}; relying on Graph mailbox fencing:`, e.message);
   }
 
   let token;
@@ -635,7 +652,7 @@ module.exports = {
   makeVaultRevocationStore,
   makeRateLimiter,
   parseState,
-  originAllowed,
+  domainMatches,
   hostAllowedByDomains,
   fetchVerifiedDomains,
   makeVerifiedDomainsGetter,
@@ -665,16 +682,9 @@ async function main() {
   const clientId = requireEnv('M365_CLIENT_ID');
   const certPath = requireEnv('M365_CERT_PEM_PATH');
   const signingSecret = requireEnv('RELAY_SIGNING_SECRET');
-  const allowed = (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  // ALLOWED_ORIGINS is now an optional static fallback — origins are also
-  // authorized dynamically against the consenting tenant's Graph-verified
-  // domains (Domain.Read.All). Empty is fine when relying purely on that.
-  if (allowed.length === 0) {
-    console.warn('ALLOWED_ORIGINS empty — authorizing origins via tenant verified domains only');
-  }
+  // Return origins are authorized SOLELY against the consenting tenant's
+  // Graph-verified (accepted) domains (Domain.Read.All) — no hand-maintained
+  // ALLOWED_ORIGINS list. See isOriginAuthorized() for the rationale.
   const defaultTtlDays = Number(process.env.CAP_TTL_DAYS) || 730;  // used when the CP sends no ttl_days
   const maxTtlDays = Number(process.env.CAP_MAX_TTL_DAYS) || 0;    // 0 = no ceiling (unlimited allowed)
 
@@ -701,7 +711,6 @@ async function main() {
 
   const config = {
     signingSecret,
-    allowedOrigins: new Set(allowed),
     defaultTtlDays,
     maxTtlDays,
     getToken,
